@@ -1,0 +1,33 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "acompanhador-onibus",
+          "appId": "1:875741196930:android:38bbaf4ab669d075dd7a9b",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "acompanhador-onibus",
+          "configurations": {
+            "android": "1:875741196930:android:38bbaf4ab669d075dd7a9b",
+            "web": "1:875741196930:web:2f605858e10e3828dd7a9b"
+          }
+        }
+      }
+    }
+  },
+  "hosting": {
+    "source": ".",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "frameworksBackend": {
+      "region": "us-east1"
+    }
+  }
+}

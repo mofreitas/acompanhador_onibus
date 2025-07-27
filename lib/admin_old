@@ -1,0 +1,525 @@
+import 'dart:async';
+
+import 'package:acompanhador_onibus_congresso/confirmacao.dart';
+import 'package:acompanhador_onibus_congresso/loading_screen.dart';
+import 'package:acompanhador_onibus_congresso/service/local_data.dart';
+import 'package:acompanhador_onibus_congresso/main.dart';
+import 'package:acompanhador_onibus_congresso/dominio/onibus_congregacao.dart';
+import 'package:acompanhador_onibus_congresso/provider.dart';
+import 'package:acompanhador_onibus_congresso/service/repository.dart';
+import 'package:acompanhador_onibus_congresso/snackbar_global.dart';
+import 'package:acompanhador_onibus_congresso/dominio/usuario.dart';
+import 'package:flutter/material.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:google_maps_flutter_platform_interface/google_maps_flutter_platform_interface.dart';
+import 'package:google_maps_flutter_android/google_maps_flutter_android.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
+
+class AdminApp extends StatefulWidget {
+  final Usuario usuario;
+
+  const AdminApp(this.usuario, {super.key});
+
+  @override
+  State<AdminApp> createState() => _AdminAppState();
+}
+
+class _AdminAppState extends State<AdminApp> {
+  late Repository repository;
+
+  @override
+  void initState() {
+    repository = Repository();
+    super.initState();
+  }
+
+
+  @override
+  void dispose() {
+    repository.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<dynamic>(
+      future: Future.wait([
+        repository.getOnibusCongregacaoProvider(),
+        repository.getConfiguracoesProvider()]),
+      builder: (BuildContext context, AsyncSnapshot<dynamic> snapshot) {
+        if (snapshot.connectionState == ConnectionState.done) {
+          if (snapshot.hasError) {
+            SnackbarGlobal.show(snapshot.error.toString());
+            LocalData.limparDados();
+            return RouterHandler();
+          } else {
+            OnibusCongregacoesProvider onibusCongregacoesProvider = snapshot.data[0];
+            ConfigProvider configProvider = snapshot.data[1];
+
+            return Scaffold(
+              appBar: BarraNavegacaoWidget(configProvider),
+              body: MapaOnibusWidget(
+                  onibusCongregacoesProvider,
+                  configProvider,
+              ),
+            );
+          }
+        } else {
+          return LoadingScreen();
+        }
+      },
+    );
+  }
+}
+
+class MapaOnibusWidget extends StatefulWidget {
+  final OnibusCongregacoesProvider onibusCongregacoesProvider;
+  final ConfigProvider configProvider;
+
+  const MapaOnibusWidget(
+    this.onibusCongregacoesProvider, this.configProvider, {super.key});
+
+  @override
+  State<MapaOnibusWidget> createState() => _MapaOnibusWidget();
+}
+
+class _MapaOnibusWidget extends State<MapaOnibusWidget> {
+  late StreamSubscription<InternetStatus>? _connectionListener;
+  late GoogleMapController mapController;
+  late ScrollController scrollController;
+  late Timer timer;
+
+  @override
+  void initState() {
+    super.initState();
+
+    final GoogleMapsFlutterPlatform mapsImplementation = GoogleMapsFlutterPlatform.instance;
+    if (mapsImplementation is GoogleMapsFlutterAndroid) {
+      mapsImplementation.useAndroidViewSurface = true;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _connectionListener = InternetConnection().onStatusChange.listen((InternetStatus status) {
+        switch (status) {
+          case InternetStatus.disconnected:
+            SnackbarGlobal.showFixedSnackbar("Não conectado à Internet");
+            break;
+          case InternetStatus.connected:
+            SnackbarGlobal.hideFixedSnackbar();
+            break;
+        }
+      });
+    });
+
+    timer = Timer.periodic(Duration(seconds: 30), (Timer t) {
+      widget.onibusCongregacoesProvider.inativaOnibusTimeout(widget.configProvider.config);
+    });
+  }
+
+  @override
+  void dispose() {
+    timer.cancel();
+    _connectionListener?.cancel();
+    SnackbarGlobal.hideFixedSnackbar();
+    super.dispose();
+  }
+
+  void _onMapCreated(GoogleMapController controller) {
+    mapController = controller;
+  }
+
+  double _calculaPosicaoLista(int index){
+    return (72.0) * index;
+  }
+
+  Future<bool?> _showConfirmacaoWhatsapp(String congregacao, String contato) async {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text(congregacao),
+          content: SingleChildScrollView(
+            child: ListBody(
+              children: <Widget>[
+                Text("Deseja mandar mensagem para $congregacao ($contato)?")
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Não'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Sim'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.onibusCongregacoesProvider,
+      builder: (BuildContext context, Widget? child) {
+        for(var item in widget.onibusCongregacoesProvider.onibusCongregacoes){
+          if (item.ativo &&
+              DateTime.now().difference(item.ultimaAtualizacao).compareTo(widget.configProvider.config.tempoInativacao) > 0) {
+            item.ativo = false;
+          }
+        }
+
+        widget.onibusCongregacoesProvider.onibusCongregacoes.sort();
+
+        return Stack(
+          children: [
+            FractionallySizedBox(
+              heightFactor: 0.70,
+              child: GoogleMap(
+                onMapCreated: _onMapCreated,
+                initialCameraPosition: CameraPosition(
+                  target: widget.configProvider.config.localizacaoCentro,
+                  zoom: 15.0,
+                ),
+                markers: {
+                  Marker(
+                      markerId: MarkerId("centro"),
+                      position: widget.configProvider.config.localizacaoCentro
+                  ),
+                  ...widget.onibusCongregacoesProvider.onibusCongregacoes
+                      .indexed
+                      .where((item) {
+                        return item.$2.ativo && !item.$2.chegouCentro;
+                      })
+                      .map((item) {
+                    return Marker(
+                      markerId: MarkerId(item.$2.nomeCongregacao),
+                      position: item.$2.localizacao!,
+                      icon: BitmapDescriptor.defaultMarkerWithHue(item.$2.cor),
+                      infoWindow: InfoWindow(
+                        title: item.$2.nomeCongregacao,
+                      ),
+                      onTap: (){
+                        scrollController.animateTo(_calculaPosicaoLista(item.$1), duration: Duration(milliseconds: 500), curve: Curves.linear);
+                      }// .defaultMarker(float hue)
+                    );
+                  }).toSet()
+                }
+              )
+            ),
+            DraggableScrollableSheet(
+              initialChildSize: 0.3, // Initial height (30% of screen)
+              minChildSize: 0.3, // Minimum height (20% of screen)
+              maxChildSize: 0.7, // Maximum height (80% of screen)
+              snap: true,
+              builder: (context, scrollController) {
+                this.scrollController = scrollController;
+                return Container(
+                  clipBehavior: Clip.hardEdge,
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).canvasColor,
+                    //borderRadius: const BorderRadius.only(
+                    //  topLeft: Radius.circular(25),
+                    //  topRight: Radius.circular(25),
+                    //),
+                  ),
+                  child: Stack(
+                      children: [
+                        Builder(
+                          builder: (_) {
+                            if (widget.onibusCongregacoesProvider.onibusCongregacoes.isEmpty) {
+                              return SingleChildScrollView(
+                                controller: scrollController,
+                                padding: EdgeInsets.fromLTRB(0,25,0,0),
+                                child: Align(
+                                  alignment: Alignment.center,
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    spacing: 10,
+                                    children: [
+                                      Icon(Icons.highlight_remove, color: Colors.grey, size: 48,),
+                                      Text("Nenhum ônibus Encontrado"),
+                                    ],
+                                  ),
+                                )
+                              );
+                            }
+                            return ListView.builder(
+                                padding: EdgeInsets.fromLTRB(0,25,0,0),
+                                controller: scrollController,
+                                itemCount: widget.onibusCongregacoesProvider.onibusCongregacoes.length,
+                                prototypeItem: ListTile(
+                                    leading: FlutterLogo(size: 35.0),
+                                    title: Text("aaa"),
+                                    subtitle: Text("aaa")
+                                ),
+                                itemBuilder: (context, index) {
+                                  OnibusCongregacao onibusCongregacao = widget.onibusCongregacoesProvider.onibusCongregacoes[index];
+
+                                  if(!onibusCongregacao.ativo){
+                                    return ListTile(
+                                      leading: Container(
+                                        height: 35,
+                                        width: 35,
+                                        decoration: BoxDecoration(
+                                            color: Colors.grey,
+                                            borderRadius: BorderRadius.all(Radius.circular(10))
+                                        ),
+                                      ),
+                                      title: Text(onibusCongregacao.nomeCongregacao),
+                                      titleTextStyle: TextStyle(color:Colors.black38, inherit: true),
+                                      subtitleTextStyle: TextStyle(color:Colors.black38, inherit: true),
+                                      subtitle: Text('Inativo'),
+                                      onLongPress: () async {
+                                        bool confirma = await _showConfirmacaoWhatsapp(onibusCongregacao.nomeCongregacao, onibusCongregacao.contato) ?? false;
+                                        if(confirma){
+                                          String androidUrl = "https://wa.me/${onibusCongregacao.contato}";
+                                          if(await canLaunchUrl(Uri.parse(androidUrl))){
+                                            await launchUrl(Uri.parse(androidUrl));
+                                          }
+                                          else{
+                                            SnackbarGlobal.show("Não foi possível mandar mensagem para ${onibusCongregacao.nomeCongregacao}");
+                                          }
+                                        }
+                                      },
+                                    );
+                                  }
+                                  else if (onibusCongregacao.chegouCentro){
+                                    return ListTile(
+                                      leading: Icon(Icons.check_circle_outline, size: 35.0, color: Colors.green),
+                                      title: Text(onibusCongregacao.nomeCongregacao),
+                                      titleTextStyle: TextStyle(color: Colors.black, inherit: true),
+                                      subtitleTextStyle: TextStyle(color:Colors.green, inherit: true),
+                                      subtitle: Text('Chegou Centro'),
+                                      onLongPress: () async {
+                                        bool confirma = await _showConfirmacaoWhatsapp(onibusCongregacao.nomeCongregacao, onibusCongregacao.contato) ?? false;
+                                        if(confirma){
+                                          String androidUrl = "https://wa.me/${onibusCongregacao.contato}";
+                                          if(await canLaunchUrl(Uri.parse(androidUrl))){
+                                            await launchUrl(Uri.parse(androidUrl));
+                                          }
+                                          else{
+                                            SnackbarGlobal.show("Não foi possível mandar mensagem para ${onibusCongregacao.nomeCongregacao}");
+                                          }
+                                        }
+                                      },
+                                    );
+                                  }
+                                  else {
+                                    return ListTile(
+                                      leading: Container(
+                                        height: 35,
+                                        width: 35,
+                                        decoration: BoxDecoration(
+                                          color:  HSVColor.fromAHSV(1, onibusCongregacao.cor, 0.77, 0.93).toColor(),
+                                          borderRadius: BorderRadius.all(Radius.circular(10))
+                                        ),
+                                      ),
+                                      titleTextStyle: TextStyle(color: Colors.black, inherit: true),
+                                      subtitleTextStyle: TextStyle(color: Colors.black, inherit: true),
+                                      title: Text(onibusCongregacao.nomeCongregacao),
+                                      subtitle: Text('Hora de chegada: ${onibusCongregacao.getHoraChegadaString()}'),
+                                      onLongPress: () async {
+                                        bool confirma = await _showConfirmacaoWhatsapp(onibusCongregacao.nomeCongregacao, onibusCongregacao.contato) ?? false;
+                                        if(confirma){
+                                          String androidUrl = "https://wa.me/${onibusCongregacao.contato}";
+                                          if(await canLaunchUrl(Uri.parse(androidUrl))){
+                                            await launchUrl(Uri.parse(androidUrl));
+                                          }
+                                          else{
+                                            SnackbarGlobal.show("Não foi possível mandar mensagem para ${onibusCongregacao.nomeCongregacao}");
+                                          }
+                                        }
+                                      },
+                                      onTap: () {
+                                        if (onibusCongregacao.localizacao != null) {
+                                          mapController.moveCamera(
+                                            CameraUpdate.newCameraPosition(
+                                              CameraPosition(
+                                                zoom: 15.0,
+                                                target: onibusCongregacao
+                                                    .localizacao!,
+                                              ),
+                                            ),
+                                          );
+                                        }
+                                      },
+                                    );
+                                  }
+                                }
+                              );
+                          },
+                        ),
+                        IgnorePointer(
+                          child: Container(
+                              color: Theme.of(context).canvasColor,
+                              height: 25,
+                              child: Row(
+                                mainAxisSize: MainAxisSize.max,
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Container(
+                                    height: 5,
+                                    width: 50,
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(10),
+                                      color: Colors.grey),
+                                  )
+                                ]
+                              )
+                          )
+                        )
+                      ],
+                  )
+                );
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class BarraNavegacaoWidget extends StatefulWidget implements PreferredSizeWidget {
+  final ConfigProvider configProvider;
+
+  const BarraNavegacaoWidget(this.configProvider, {super.key});
+
+  @override
+  State<BarraNavegacaoWidget> createState() => _BarraNavegacaoWidget();
+
+  @override
+  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
+}
+
+class _BarraNavegacaoWidget extends State<BarraNavegacaoWidget> {
+  bool envioPendente = false;
+  late Repository repository;
+  late StreamSubscription<InternetStatus> _connectionListener;
+  bool conectado = true;
+
+  @override
+  void initState() {
+    super.initState();
+    repository = Repository();
+
+    _connectionListener = InternetConnection().onStatusChange.listen((InternetStatus status) {
+      if(mounted) {
+        if (status == InternetStatus.disconnected) {
+          setState(() {
+            conectado = false;
+          });
+        }
+        else if (status == InternetStatus.connected) {
+          setState(() {
+            conectado = true;
+          });
+        }
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+        listenable: widget.configProvider,
+        builder: (ctx, wgt) {
+          return AppBar(
+            title: const Text('Admin'),
+            backgroundColor:  Theme.of(context).colorScheme.onSecondary,
+            actions: () {
+              List<Widget> icons = [
+                IconButton(
+                  icon: const Icon(Icons.logout),
+                  tooltip: 'Sair',
+                  onPressed: () async {
+                    await LocalData.limparDados();
+                    if(ctx.mounted) {
+                      Navigator.pushAndRemoveUntil(
+                        ctx,
+                        MaterialPageRoute(
+                            builder: (context) => RouterHandler()),
+                            (_) => false,
+                      );
+                    }
+                  },
+                )
+              ];
+
+              if(widget.configProvider.config.envioAtivo) {
+                icons.add(
+                    IconButton(
+                      icon: const Icon(Icons.location_off),
+                      tooltip: 'Ativar Localização',
+                      onPressed: envioPendente || !conectado ? null : () async {
+                        if(ctx.mounted) {
+                          setState(() {
+                            envioPendente = true;
+                          });
+                        }
+
+                        bool resultadoConfirmacao = await showConfirmacao(context, "Confirmação", "Deseja desativar a localização para todos os usuários?") ?? false;
+
+                        if(ctx.mounted) {
+                          if(resultadoConfirmacao){
+                            await repository.atualizaLocalizacaoTodosOnibus(false);
+                          }
+
+                          SnackbarGlobal.show("Localização desativada com sucesso!");
+
+                          setState(() {
+                            envioPendente = false;
+                          });
+                        }
+                      },
+                    )
+                );
+              } else {
+                icons.add(
+                    IconButton(
+                        icon: const Icon(Icons.location_on),
+                        tooltip: 'Ativar Localização',
+                        onPressed: envioPendente || !conectado ? null : () async {
+                          if(ctx.mounted) {
+                            setState(() {
+                              envioPendente = true;
+                            });
+                          }
+
+                          bool resultadoConfirmacao = await showConfirmacao(context, "Confirmação", "Deseja ativar a localização para todos os usuários?") ?? false;
+                          if(ctx.mounted) {
+                            if (resultadoConfirmacao) {
+                              await repository.atualizaLocalizacaoTodosOnibus(
+                                  true);
+                            }
+
+                            SnackbarGlobal.show(
+                                "Localização ativada com sucesso!");
+                            setState(() {
+                              envioPendente = false;
+                            });
+                          }
+                        }
+                    )
+                );
+              }
+
+              return icons;
+            }(),
+          );
+        });
+  }
+
+  @override
+  void dispose() {
+    _connectionListener.cancel();
+    repository.close();
+    super.dispose();
+  }
+}
